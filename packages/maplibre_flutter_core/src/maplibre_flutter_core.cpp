@@ -632,7 +632,14 @@ void renderThreadMain(MblMap *m, uint32_t width, uint32_t height,
   m->renderWidth = width;
   m->renderHeight = height;
   if (!styleUri.empty()) {
-    map.getStyle().loadURL(styleUri);
+    // Spike: inline JSON styles (start with '{') go through loadJSON; anything
+    // else is a URL. Matches mbl_map_set_style.
+    const auto j = styleUri.find_first_not_of(" \t\r\n");
+    if (j != std::string::npos && styleUri[j] == '{') {
+      map.getStyle().loadJSON(styleUri);
+    } else {
+      map.getStyle().loadURL(styleUri);
+    }
   }
 
   {
@@ -897,7 +904,14 @@ void renderThreadMainContinuous(MblMap *m, uint32_t width, uint32_t height,
   m->renderWidth = width;
   m->renderHeight = height;
   if (!styleUri.empty()) {
-    map.getStyle().loadURL(styleUri);
+    // Spike: inline JSON styles (start with '{') go through loadJSON; anything
+    // else is a URL. Matches mbl_map_set_style.
+    const auto j = styleUri.find_first_not_of(" \t\r\n");
+    if (j != std::string::npos && styleUri[j] == '{') {
+      map.getStyle().loadJSON(styleUri);
+    } else {
+      map.getStyle().loadURL(styleUri);
+    }
   }
   m->renderLoop = &loop;
 
@@ -987,7 +1001,15 @@ void mbl_map_set_style(MblMap *m, const char *style_uri) {
   }
   const std::string style(style_uri);
   m->post([m, style] {
-    m->map->getStyle().loadURL(style);
+    // Spike: support inline JSON styles (documented as "URL, asset path, or
+    // inline JSON" but previously always loadURL'd). A style that starts with
+    // '{' after optional whitespace is inline JSON; otherwise it's a URL.
+    const auto i = style.find_first_not_of(" \t\r\n");
+    if (i != std::string::npos && style[i] == '{') {
+      m->map->getStyle().loadJSON(style);
+    } else {
+      m->map->getStyle().loadURL(style);
+    }
     m->renderRequested = true;
   });
 }

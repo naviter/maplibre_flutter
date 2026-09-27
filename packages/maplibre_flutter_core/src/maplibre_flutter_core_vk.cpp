@@ -417,8 +417,11 @@ int mbl_vk_presenter_present(MblVkPresenter *p, void **out_handle) {
           vk::Offset3D(static_cast<int32_t>(w), static_cast<int32_t>(h), 1);
       blit.dstSubresource =
           vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
-      blit.dstOffsets[0] = vk::Offset3D(0, static_cast<int32_t>(h), 0);
-      blit.dstOffsets[1] = vk::Offset3D(static_cast<int32_t>(w), 0, 1);
+      // Spike fix (Windows first hardware run): the Y-flip here rendered the map
+      // upside-down on this GPU. Straight copy (dst matches src) is correct.
+      blit.dstOffsets[0] = vk::Offset3D(0, 0, 0);
+      blit.dstOffsets[1] =
+          vk::Offset3D(static_cast<int32_t>(w), static_cast<int32_t>(h), 1);
       cb->blitImage(src, vk::ImageLayout::eTransferSrcOptimal, slot.image,
                     vk::ImageLayout::eTransferDstOptimal, blit,
                     vk::Filter::eNearest, disp);
