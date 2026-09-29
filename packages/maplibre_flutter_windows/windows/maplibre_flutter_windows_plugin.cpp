@@ -191,7 +191,10 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
       t->texture_id = id;  // set before wiring the callback so the first frame
                            // marks a valid id
       tp->set_frame_callback(tp->map_handle, OnFrameReady, tp);
-      registered_[id] = std::move(t);
+      {
+        std::lock_guard<std::mutex> lock(registered_mutex_);
+        registered_[id] = std::move(t);
+      }
       result->Success(EncodableValue(id));
     } else if (method == "registerTextureGpu") {
       // Zero-copy: present mbgl's frame as a Flutter GpuSurfaceTexture backed by a
@@ -247,23 +250,43 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
       const int64_t id = textures_->RegisterTexture(t->variant.get());
       t->texture_id = id;
       tp->set_frame_callback(tp->map_handle, OnFrameReady, tp);
-      registered_[id] = std::move(t);
+      {
+        std::lock_guard<std::mutex> lock(registered_mutex_);
+        registered_[id] = std::move(t);
+      }
       result->Success(EncodableValue(id));
     } else if (method == "unregisterTexture") {
       const auto* id_v = std::get_if<int64_t>(call.arguments());
+      MapTexture* t = nullptr;
       if (id_v != nullptr) {
+        std::lock_guard<std::mutex> lock(registered_mutex_);
         auto it = registered_.find(*id_v);
-        if (it != registered_.end()) {
-          // Stop the core firing frames first, then unregister (async); drop our
-          // owning entry only once the engine confirms it's done reading.
-          it->second->set_frame_callback(it->second->map_handle, nullptr,
-                                         nullptr);
-          const int64_t id = *id_v;
-          textures_->UnregisterTexture(id,
-                                       [this, id]() { registered_.erase(id); });
-        }
+        if (it != registered_.end()) t = it->second.get();
       }
-      result->Success();
+      if (t == nullptr) {
+        result->Success();
+        return;
+      }
+      // Stop the core firing frames first (synchronous: once this returns the core
+      // will never call OnFrameReady for this texture again), then unregister.
+      t->set_frame_callback(t->map_handle, nullptr, nullptr);
+      // Reply ONLY once the engine confirms it is done with the texture. The Dart
+      // side frees the native map as soon as this call returns, and the raster
+      // thread reads that map from this texture's callbacks (current_d3d /
+      // copy_frame) until the unregistration completes. Replying immediately (as
+      // before) let the map be deleted under a still-running raster callback — a
+      // use-after-free that crashed when flight windows were closed or rebuilt.
+      // The completion runs on the raster thread; the client wrapper allows
+      // replies from any thread.
+      const int64_t id = *id_v;
+      std::shared_ptr<MethodResult<EncodableValue>> pending(std::move(result));
+      textures_->UnregisterTexture(id, [this, id, pending]() {
+        {
+          std::lock_guard<std::mutex> lock(registered_mutex_);
+          registered_.erase(id);
+        }
+        pending->Success();
+      });
     } else {
       result->NotImplemented();
     }
@@ -271,6 +294,9 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
 
   flutter::TextureRegistrar* textures_;  // borrowed
   std::unique_ptr<flutter::MethodChannel<EncodableValue>> channel_;
+  // Inserted on the platform thread, erased on the raster thread (unregister
+  // completion) — every access goes through registered_mutex_.
+  std::mutex registered_mutex_;
   std::map<int64_t, std::unique_ptr<MapTexture>> registered_;  // owning
 };
 

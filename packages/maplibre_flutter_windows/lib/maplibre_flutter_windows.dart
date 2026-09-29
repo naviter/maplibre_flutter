@@ -1,3 +1,4 @@
+import 'package:maplibre_flutter_core/maplibre_flutter_core.dart' as core;
 import 'package:maplibre_flutter_platform_interface/maplibre_flutter_platform_interface.dart';
 
 import 'src/maplibre_flutter_windows_controller.dart';
@@ -23,4 +24,13 @@ class MapLibreFlutterWindows extends MapLibreFlutterPlatform {
     required String style,
     required MapOptions options,
   }) => MapLibreFlutterWindowsController.create(style, options);
+
+  /// Creates the process-wide Vulkan instance on a background thread (see the
+  /// core's `mbl_prewarm`), so the first map view doesn't spend ~1.6 s in driver
+  /// initialisation on the UI's clock.
+  @override
+  void prewarm() => core.MapLibreCoreMap.prewarm();
+
+  @override
+  void setCachePath(String path) => core.MapLibreCoreMap.setCachePath(path);
 }

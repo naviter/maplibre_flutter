@@ -51,4 +51,15 @@ abstract class MapLibreFlutterPlatform extends PlatformInterface {
   }) {
     throw UnimplementedError('createMap() has not been implemented.');
   }
+
+  /// Warms the renderer ahead of the first map, in the background, so the
+  /// one-time native initialisation (driver/instance setup) is not paid while
+  /// the user waits for a map to appear. Returns immediately; idempotent.
+  /// Default: no-op (a tier with nothing expensive to warm).
+  void prewarm() {}
+
+  /// Persists map resources (tiles, sprites, glyphs) in a cache file at [path]
+  /// so they survive app restarts, where the tier's renderer supports it. Call
+  /// once, before the first map. Default: no-op (the tier manages its own cache).
+  void setCachePath(String path) {}
 }

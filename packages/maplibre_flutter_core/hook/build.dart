@@ -197,6 +197,28 @@ Future<void> _applySubmodulePatches(
       marker: 'MBL_WIN32_EXTERNAL_MEMORY',
       patch: 'patches/windows-vulkan-external-memory.patch',
     ),
+    // One VkInstance per process. vkCreateInstance makes the Vulkan loader load and
+    // initialise every ICD + implicit layer — ~1.6 s on an Intel iGPU — and mbgl paid it
+    // for EVERY map (every map view froze the app for 1.5 s+ while it was created). The
+    // instance holds no per-map state (each map keeps its own VkDevice/queues/allocator),
+    // so it is created once, kept for the process, and each backend just borrows it;
+    // mbl_prewarm() creates it on a background thread at startup. MUST come after the
+    // external-memory patch (same file).
+    (
+      file: 'src/mbgl/vulkan/renderer_backend.cpp',
+      marker: 'MBL_SHARED_VK_INSTANCE',
+      patch: 'patches/windows-vulkan-shared-instance.patch',
+    ),
+    // Resource cache database in WAL mode with NORMAL sync. Every cache read updates
+    // an `accessed` timestamp in its own transaction; with mbgl's DELETE journal +
+    // FULL sync each one was a journal-file fsync, so a persistent (on-disk) cache
+    // made map loads slower than the in-memory default. WAL/NORMAL keeps the file
+    // crash-consistent and makes those commits log appends.
+    (
+      file: 'platform/default/src/mbgl/storage/offline_database.cpp',
+      marker: 'MBL_CACHE_DB_WAL',
+      patch: 'patches/cache-db-wal.patch',
+    ),
     // Metal: make 3D custom-drawable geometry actually depth-test. mtl::Drawable
     // deliberately skips setting its own depth/stencil state when is3D ("handled
     // by the layer group", drawable.cpp:244) — but mtl::TileLayerGroup only

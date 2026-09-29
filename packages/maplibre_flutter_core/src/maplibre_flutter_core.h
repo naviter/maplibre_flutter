@@ -240,6 +240,13 @@ FFI_PLUGIN_EXPORT uint64_t mbl_map_presented_generation(MblMap *map);
 // before the first snapshot.
 FFI_PLUGIN_EXPORT uint64_t mbl_map_proj_generation(MblMap *map);
 
+// The viewport size (logical points) of the transform that produced the frame
+// now on screen. It lags a resize until a frame at the new size is published,
+// so a host can keep showing the old frame undistorted until then. 0x0 before
+// the first frame.
+FFI_PLUGIN_EXPORT void mbl_map_presented_size(MblMap *map, uint32_t *out_width,
+                                              uint32_t *out_height);
+
 // Register (or clear, with NULL) the frame-ready callback. See MblFrameCallback.
 FFI_PLUGIN_EXPORT void mbl_map_set_frame_callback(MblMap *map,
                                                   MblFrameCallback callback,
@@ -442,6 +449,19 @@ FFI_PLUGIN_EXPORT int mbl_map_write_png(MblMap *map, const char *path);
 
 // Stop the render thread and free all resources. The handle is invalid after.
 FFI_PLUGIN_EXPORT void mbl_map_destroy(MblMap *map);
+
+// Warm the renderer on a background thread: returns immediately; only the first call
+// does anything. Builds and discards a tiny map, so the process-wide state the first
+// real map would otherwise create while the user waits already exists when a map is
+// shown — above all the shared Vulkan instance on Windows (~1.6 s of ICD/implicit-layer
+// initialisation; see the shared-instance mbgl patch). Call it early (app start).
+FFI_PLUGIN_EXPORT void mbl_prewarm(void);
+
+// Persist map resources (tiles, sprites, glyphs, styles) in an SQLite database at
+// `path` — mbgl's ambient cache — instead of the default in-memory cache that dies
+// with the process. Shared by every map created afterwards; call it once, before the
+// first map (and before mbl_prewarm). NULL or "" restores the in-memory default.
+FFI_PLUGIN_EXPORT void mbl_set_cache_path(const char *path);
 
 #ifdef __cplusplus
 } // extern "C"

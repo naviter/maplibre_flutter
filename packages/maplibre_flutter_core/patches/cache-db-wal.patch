@@ -1,0 +1,43 @@
+diff --git a/platform/default/src/mbgl/storage/offline_database.cpp b/platform/default/src/mbgl/storage/offline_database.cpp
+index 10a76fe..b048ae8 100644
+--- a/platform/default/src/mbgl/storage/offline_database.cpp
++++ b/platform/default/src/mbgl/storage/offline_database.cpp
+@@ -64,7 +64,7 @@ void OfflineDatabase::initialize() {
+             // Newly created database, or old cache-only database; remove old table if it exists.
+             removeOldCacheTable();
+             createSchema();
+-            return;
++            break;
+         case 2:
+             migrateToVersion3();
+             // fall through
+@@ -79,12 +79,28 @@ void OfflineDatabase::initialize() {
+             // fall through
+         case 6:
+             // Happy path; we're done
+-            return;
++            break;
+         default:
+             // Downgrade: delete the database and try to reinitialize.
+             removeExisting();
+             initialize();
+     }
++
++    // MBL_CACHE_DB_WAL (maplibre_flutter committed patch): WAL journal + NORMAL sync.
++    //
++    // Every cache READ updates the row's `accessed` timestamp (getResource/getTile, for
++    // LRU eviction) as its own autocommit transaction. With the DELETE journal and FULL
++    // sync set above, each of those is a journal-file create/fsync/delete — dozens per
++    // map view — so a disk-backed cache made in-session map loads SLOWER than the
++    // in-memory default (measured ~520 ms vs ~330 ms to fully render a view). In WAL
++    // mode with NORMAL sync, commits just append to the log (fsync only at checkpoints)
++    // and the database stays consistent across crashes; a power loss can at worst drop
++    // the most recent cache entries — fine for a cache. Upstream reverted WAL (schema v4)
++    // over databases shared between processes; ours is a private per-user cache file.
++    // Applied per connection, after schema creation/migration (never inside a
++    // transaction, which WAL mode requires).
++    db->exec("PRAGMA journal_mode = WAL");
++    db->exec("PRAGMA synchronous = NORMAL");
+ }
+ 
+ void OfflineDatabase::changePath(const std::string& path_) {

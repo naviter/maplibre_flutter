@@ -218,7 +218,7 @@ class MapLibreFlutterLinuxController
     // here — the core already knows the density.) Linux presents through the same
     // slow CPU-readback FlPixelBufferTexture as Windows, so the controller is a
     // MapLibreResizeMaskHint: the MapLibreMap widget debounces these calls during
-    // an active drag and cover-fits the frozen frame in the meantime, so the map
+    // an active drag and shows the frozen frame 1:1 in the meantime, so the map
     // never stretches while the window is resized.
     final w = size.width.round();
     final h = size.height.round();
@@ -227,6 +227,14 @@ class MapLibreFlutterLinuxController
     _renderHeight = h;
     _coreMap.resize(w, h);
     notifyCameraChanged(); // viewport size feeds the projection
+  }
+
+  @override
+  ui.Size? get presentedSize {
+    if (_disposed) return null;
+    final s = _coreMap.presentedSize;
+    if (s.width == 0 || s.height == 0) return null;
+    return ui.Size(s.width.toDouble(), s.height.toDouble());
   }
 
   @override

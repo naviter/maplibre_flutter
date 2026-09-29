@@ -48,13 +48,17 @@ abstract class MapLibreMapPlatformController {
 ///
 /// When a controller implements it, the `MapLibreMap` widget **masks** resizes:
 /// while the window is actively being dragged it holds the native surface at one
-/// size and cover-fits that frozen frame to the moving box (a small uniform crop,
-/// not a stretch), then pushes the real resize once the drag settles and lets the
-/// texture catch up. Because the widget controls when it resizes, it always knows
-/// the frozen frame's size — no produced-size feedback from the native side.
+/// size and shows that frozen frame 1:1, centred in the moving box (the engine
+/// keeps the camera centre across a resize, so nothing moves or stretches), then
+/// pushes the real resize once the drag settles and keeps showing the old frame
+/// until [presentedSize] reports that a frame at the new size is on screen.
 ///
 /// Controllers that don't implement it (mobile/web own their surface; macOS
 /// zero-copy catches up within a frame) resize live, so this stays an opt-in that
 /// doesn't ripple into the other implementations — the same pattern as
 /// [MapLibreGestureHandler].
-abstract interface class MapLibreResizeMaskHint {}
+abstract interface class MapLibreResizeMaskHint {
+  /// The logical size of the frame currently on screen, or null before the
+  /// first frame.
+  Size? get presentedSize;
+}

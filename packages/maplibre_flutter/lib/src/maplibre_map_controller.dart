@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'dart:ui' show Size;
+import 'dart:ui' show Offset, Size;
 
-import 'package:flutter/foundation.dart' show Listenable;
+import 'package:flutter/foundation.dart' show Listenable, ValueNotifier;
 
 import 'package:maplibre_flutter_platform_interface/maplibre_flutter_platform_interface.dart';
 import 'package:meta/meta.dart';
@@ -58,6 +58,14 @@ class MapLibreMapController {
   /// [MapLibreLayersController]; `layers.isSupported` is false on renderers that
   /// cannot do it, and every call is then a no-op.
   final MapLibreLayersController layers = MapLibreLayersController();
+
+  /// Where the frame the map is showing sits in the widget box (logical px):
+  /// zero, except while a resize is being masked on a lagging tier, when the
+  /// frame rendered at the previous size is shown 1:1 and centred in the new
+  /// box. The engine keeps the camera centre across a resize, so the frozen
+  /// frame lines up with the one that replaces it. [projector] works in the
+  /// frame's own space: box point p is frame point p - frameOffset.
+  final ValueNotifier<Offset> frameOffset = ValueNotifier<Offset>(Offset.zero);
 
   /// Whether a native map is currently bound (true between [attach] and
   /// [detach]/[dispose]).
@@ -160,8 +168,8 @@ class MapLibreMapController {
 
   /// The platform controller's Dart gesture handler when it drives gestures in
   /// Dart (desktop tier); null on mobile/web. The widget uses this to decide
-  /// whether to attach its Dart gesture layer.
-  @internal
+  /// whether to attach its Dart gesture layer. Public so apps can drive
+  /// relative camera moves (e.g. a custom cursor-anchored wheel zoom).
   MapLibreGestureHandler? get gestureHandler {
     // The render handle and the gesture-handler interface are unrelated types,
     // so `is` does not promote across them — cast inside the guard.
@@ -174,8 +182,8 @@ class MapLibreMapController {
   /// The platform controller's projector when its renderer supports anchoring
   /// widgets to geographic points (the default `mbgl-core` tiers); null on tiers
   /// that don't. The widget uses this to decide whether to render the marker
-  /// overlay. Feature-detected like [gestureHandler].
-  @internal
+  /// overlay. Feature-detected like [gestureHandler]. Also public so apps can
+  /// build their own map-anchored overlays / hit-testing (e.g. a flight track).
   MapLibreMapProjector? get projector {
     final platform = _platform;
     return platform is MapLibreMapProjector
@@ -260,11 +268,21 @@ class MapLibreMapController {
       _platform?.resize(size, devicePixelRatio);
 
   /// Whether the bound platform tier's texture lags the widget box on resize
-  /// (Windows), so the widget should **mask** resizes (hold the surface + cover-fit
-  /// while dragging) instead of resizing live. False on tiers that resize cleanly
-  /// (mobile/web/macOS). See [MapLibreResizeMaskHint].
+  /// (Windows), so the widget should **mask** resizes (hold the surface and show
+  /// the frozen frame 1:1 while dragging) instead of resizing live. False on
+  /// tiers that resize cleanly (mobile/web/macOS). See [MapLibreResizeMaskHint].
   @internal
   bool get debounceResize => _platform is MapLibreResizeMaskHint;
+
+  /// On masked tiers, the logical size of the frame on screen (null before the
+  /// first frame or on other tiers). See [MapLibreResizeMaskHint.presentedSize].
+  @internal
+  Size? get presentedSize {
+    final platform = _platform;
+    return platform is MapLibreResizeMaskHint
+        ? (platform as MapLibreResizeMaskHint).presentedSize
+        : null;
+  }
 }
 
 /// Camera control for a [MapLibreMap], reached via [MapLibreMapController.camera].

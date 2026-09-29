@@ -1,0 +1,89 @@
+diff --git a/include/mbgl/vulkan/renderer_backend.hpp b/include/mbgl/vulkan/renderer_backend.hpp
+index 295fc58..ccab50a 100644
+--- a/include/mbgl/vulkan/renderer_backend.hpp
++++ b/include/mbgl/vulkan/renderer_backend.hpp
+@@ -91,6 +91,7 @@ protected:
+     std::vector<const char*> getDebugExtensions();
+ 
+     virtual void initInstance();
++    void createSharedInstance(); // MBL_SHARED_VK_INSTANCE: builds the one process instance
+     virtual void initDebug();
+     virtual void initSurface();
+     virtual void initDevice();
+@@ -127,6 +128,9 @@ protected:
+ 
+     bool debugUtilsEnabled{false};
+     bool usingSharedContext{false};
++    // MBL_SHARED_VK_INSTANCE: `instance` is the process-wide shared VkInstance (see
++    // initInstance) — released, never destroyed, when this backend goes away.
++    bool usingSharedInstance{false};
+ };
+ 
+ } // namespace vulkan
+diff --git a/src/mbgl/vulkan/renderer_backend.cpp b/src/mbgl/vulkan/renderer_backend.cpp
+index 08a3905..37cb339 100644
+--- a/src/mbgl/vulkan/renderer_backend.cpp
++++ b/src/mbgl/vulkan/renderer_backend.cpp
+@@ -29,6 +29,7 @@
+ #include <mbgl/shaders/vulkan/widevector.hpp>
+ 
+ #include <cassert>
++#include <mutex>
+ #include <string>
+ 
+ #ifdef ENABLE_VULKAN_VALIDATION
+@@ -411,7 +412,45 @@ void RendererBackend::init() {
+     initCommandPool();
+ }
+ 
++// MBL_SHARED_VK_INSTANCE (maplibre_flutter committed patch): one VkInstance per process.
++//
++// Creating an instance makes the Vulkan loader load and initialise every installed ICD
++// and implicit layer — measured at ~1.6 s on an Intel iGPU — and mbgl paid that for EVERY
++// map, so each new map view (e.g. each flight window) froze for well over a second. The
++// instance carries no per-map state: every backend still creates its own VkDevice, queues,
++// allocator and command pool, so sharing it needs no extra synchronisation (instance-level
++// calls are thread-safe; only vkDestroyInstance needs external sync, and we never destroy
++// it). It is created by the first backend under a mutex and deliberately leaked for the
++// process lifetime, together with a DynamicLoader that keeps the Vulkan loader library
++// pinned — so the handle stays valid even while no backend exists. A host can also create
++// it early on a background thread (by constructing and discarding a backend) so that even
++// the first map skips the cost.
++namespace {
++struct SharedVkInstance {
++    std::mutex mutex;
++    vk::Instance instance{};
++    DynamicLoader* pinnedLoader = nullptr;
++};
++SharedVkInstance& sharedVkInstance() {
++    static auto* shared = new SharedVkInstance(); // intentionally leaked (process lifetime)
++    return *shared;
++}
++} // namespace
++
+ void RendererBackend::initInstance() {
++    auto& shared = sharedVkInstance();
++    std::lock_guard<std::mutex> lock(shared.mutex);
++    if (!shared.instance) {
++        createSharedInstance();
++        shared.pinnedLoader = new DynamicLoader(); // pins the loader library (leaked)
++        shared.instance = instance.release();      // the process owns it from now on
++    }
++    // Non-owning view: released (never destroyed) in destroyResources.
++    instance = vk::UniqueInstance(shared.instance);
++    usingSharedInstance = true;
++}
++
++void RendererBackend::createSharedInstance() {
+     // Vulkan 1.1 on Android is supported on 71% of devices (compared to 1.3 with 6%) as of April 23 2024
+     // https://vulkan.gpuinfo.org/
+ #ifdef __APPLE__
+@@ -676,7 +715,7 @@ void RendererBackend::destroyResources() {
+     debugUtilsCallback.reset();
+     debugReportCallback.reset();
+ 
+-    usingSharedContext ? void(instance.release()) : instance.reset();
++    (usingSharedContext || usingSharedInstance) ? void(instance.release()) : instance.reset();
+ }
+ 
+ /// @brief Register a list of types with a shader registry instance

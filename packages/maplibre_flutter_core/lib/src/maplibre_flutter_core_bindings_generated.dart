@@ -273,6 +273,19 @@ external int mbl_map_proj_generation(ffi.Pointer<MblMap> map);
 @ffi.Native<
   ffi.Void Function(
     ffi.Pointer<MblMap>,
+    ffi.Pointer<ffi.Uint32>,
+    ffi.Pointer<ffi.Uint32>,
+  )
+>()
+external void mbl_map_presented_size(
+  ffi.Pointer<MblMap> map,
+  ffi.Pointer<ffi.Uint32> out_width,
+  ffi.Pointer<ffi.Uint32> out_height,
+);
+
+@ffi.Native<
+  ffi.Void Function(
+    ffi.Pointer<MblMap>,
     ffi.Pointer<
       ffi.NativeFunction<ffi.Void Function(ffi.Pointer<ffi.Void> user)>
     >,
@@ -440,6 +453,12 @@ external int mbl_map_write_png(
 
 @ffi.Native<ffi.Void Function(ffi.Pointer<MblMap>)>()
 external void mbl_map_destroy(ffi.Pointer<MblMap> map);
+
+@ffi.Native<ffi.Void Function()>()
+external void mbl_prewarm();
+
+@ffi.Native<ffi.Void Function(ffi.Pointer<ffi.Char>)>()
+external void mbl_set_cache_path(ffi.Pointer<ffi.Char> path);
 
 final class MblMap extends ffi.Opaque {}
 

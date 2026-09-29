@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -15,6 +16,16 @@ import 'package:maplibre_flutter_platform_interface/maplibre_flutter_platform_in
 const MethodChannel _registrar = MethodChannel(
   'maplibre_flutter/windows/registrar',
 );
+
+// Startup timing (MAPLIBRE_TIMING env var): same stream + format as the core's
+// `[mbl-timing]` lines so the phases line up.
+final bool _timing = io.Platform.environment.containsKey('MAPLIBRE_TIMING');
+void _timingLog(String event) {
+  if (!_timing) return;
+  io.stderr.writeln(
+    '[win-timing] ${DateTime.now().millisecondsSinceEpoch} $event',
+  );
+}
 
 /// Controller for a map composited through a Flutter `Texture` on Windows.
 ///
@@ -66,6 +77,7 @@ class MapLibreFlutterWindowsController
     // map blown up — more area, tiny labels, tile edges on fractional device pixels).
     final dpr =
         ui.PlatformDispatcher.instance.implicitView?.devicePixelRatio ?? 1.0;
+    _timingLog('create: begin (core create blocks the UI thread)');
     final coreMap = core.MapLibreCoreMap.create(
       width: _initialWidth,
       height: _initialHeight,
@@ -85,6 +97,7 @@ class MapLibreFlutterWindowsController
       bearing: camera.bearing,
       pitch: camera.pitch,
     );
+    _timingLog('create: core map created');
 
     // Zero-copy D3D11 present (the core blits into a shared D3D11 texture ring;
     // the plugin presents it as a Flutter GpuSurfaceTexture via a DXGI shared
@@ -101,7 +114,9 @@ class MapLibreFlutterWindowsController
     int? textureId;
     if (wantZeroCopy) {
       coreMap.setZeroCopy(true);
-      if (await _confirmZeroCopyActive(coreMap)) {
+      final zc = await _confirmZeroCopyActive(coreMap);
+      _timingLog('create: zero-copy probe done (active=$zc)');
+      if (zc) {
         try {
           textureId = await _registrar
               .invokeMethod<int>('registerTextureGpu', <String, Object?>{
@@ -134,19 +149,23 @@ class MapLibreFlutterWindowsController
           });
     }
 
+    _timingLog('create: texture registered (id=$textureId)');
     return MapLibreFlutterWindowsController._(coreMap, textureId ?? -1);
   }
 
   /// Polls (up to ~1s) for the native D3D presenter to come up after
-  /// [setZeroCopy](true) is processed on the render thread.
+  /// [setZeroCopy](true) is processed on the render thread. Fine-grained: the
+  /// presenter is typically up a few ms after the first check, and a 50 ms tick
+  /// made every map open wait out most of a tick for nothing.
   static Future<bool> _confirmZeroCopyActive(
     core.MapLibreCoreMap coreMap,
   ) async {
-    for (var i = 0; i < 20; i++) {
+    final deadline = Stopwatch()..start();
+    while (deadline.elapsedMilliseconds < 1000) {
       if (coreMap.isZeroCopyActive()) return true;
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await Future<void>.delayed(const Duration(milliseconds: 4));
     }
-    return false;
+    return coreMap.isZeroCopyActive();
   }
 
   /// Polls until the first frame has rendered, then completes [onReady].
@@ -219,7 +238,7 @@ class MapLibreFlutterWindowsController
     // at create to produce the device-pixel texture. (devicePixelRatio is unused
     // here — the core already knows the density.) The MapLibreMap widget debounces
     // these calls during an active drag (see MapLibreResizeMaskHint) so the core is
-    // only resized once the window settles — it cover-fits the frozen frame in the
+    // only resized once the window settles — it shows the frozen frame 1:1 in the
     // meantime, so the map never stretches on the slow CPU-readback present.
     final w = size.width.round();
     final h = size.height.round();
@@ -228,6 +247,14 @@ class MapLibreFlutterWindowsController
     _renderHeight = h;
     _coreMap.resize(w, h);
     notifyCameraChanged(); // viewport size feeds the projection
+  }
+
+  @override
+  ui.Size? get presentedSize {
+    if (_disposed) return null;
+    final s = _coreMap.presentedSize;
+    if (s.width == 0 || s.height == 0) return null;
+    return ui.Size(s.width.toDouble(), s.height.toDouble());
   }
 
   @override

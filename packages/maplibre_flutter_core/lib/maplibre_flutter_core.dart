@@ -130,6 +130,26 @@ class MapLibreCoreMap {
           >(bindings.mbl_map_current_d3d_handle)
           .address;
 
+  /// Warms the native renderer on a background thread and returns immediately;
+  /// only the first call does anything. It builds and discards a tiny map so the
+  /// process-wide renderer state (on Windows the shared Vulkan instance, ~1.6 s
+  /// of driver/layer initialisation) exists before the first real map is
+  /// created, instead of being paid while the user waits. Call it at app start.
+  static void prewarm() => bindings.mbl_prewarm();
+
+  /// Persists map resources (tiles, sprites, glyphs) in an SQLite cache file at
+  /// [path] instead of the default in-memory cache that dies with the process.
+  /// Applies to every map created afterwards — call once, before the first map
+  /// and before [prewarm].
+  static void setCachePath(String path) {
+    final p = path.toNativeUtf8();
+    try {
+      bindings.mbl_set_cache_path(p.cast());
+    } finally {
+      malloc.free(p);
+    }
+  }
+
   /// Creates an off-screen map of [width]x[height] device pixels at
   /// [pixelRatio], loading [styleUri]. Throws if the native map cannot be made.
   ///
@@ -789,6 +809,19 @@ class MapLibreCoreMap {
   int get projectionGeneration {
     _checkAlive();
     return bindings.mbl_map_proj_generation(_handle);
+  }
+
+  /// The viewport size (logical points) of the frame currently ON SCREEN:
+  /// after [resize] it keeps reporting the old size until a frame rendered at
+  /// the new one is published. `(0, 0)` before the first frame.
+  ({int width, int height}) get presentedSize {
+    _checkAlive();
+    return using((arena) {
+      final w = arena<ffi.Uint32>();
+      final h = arena<ffi.Uint32>();
+      bindings.mbl_map_presented_size(_handle, w, h);
+      return (width: w.value, height: h.value);
+    });
   }
 
   void _ensureProjCapacity(int count) {

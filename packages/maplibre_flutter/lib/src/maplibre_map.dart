@@ -25,6 +25,30 @@ import 'marker_overlay.dart';
 /// [controller], and call its methods once [MapLibreMapController.onReady]
 /// completes. Omit [controller] and the widget creates and owns one internally.
 class MapLibreMap extends StatefulWidget {
+  /// Warms the native renderer in the background so the first [MapLibreMap] a
+  /// user opens appears without the one-time driver initialisation delay (on
+  /// Windows ~1.6 s of Vulkan instance setup). Returns immediately; safe to call
+  /// repeatedly. Call it early — e.g. right after `runApp`.
+  static void prewarm() {
+    try {
+      MapLibreFlutterPlatform.instance.prewarm();
+    } on UnimplementedError {
+      // No platform registered (tests / unsupported host): nothing to warm.
+    }
+  }
+
+  /// Keeps downloaded map resources (tiles, sprites, glyphs) in a cache file at
+  /// [path], so a relaunch — or a view of an area seen before — loads them from
+  /// disk instead of the network. Call once at startup, before the first map
+  /// and before [prewarm]. No-op on tiers that manage their own cache.
+  static void setCachePath(String path) {
+    try {
+      MapLibreFlutterPlatform.instance.setCachePath(path);
+    } on UnimplementedError {
+      // No platform registered: nothing to configure.
+    }
+  }
+
   const MapLibreMap({
     super.key,
     required this.style,
@@ -283,10 +307,12 @@ class _MapEmbed extends StatelessWidget {
 /// On tiers whose texture *lags* the widget box during a resize
 /// ([MapLibreMapController.debounceResize] — the Windows CPU-readback present), it
 /// also **masks** the resize: while the window is actively being dragged it holds
-/// the core at one size and cover-fits that frozen frame to the moving box (a
-/// small uniform crop, not a stretch), pushing the real resize once the drag
-/// settles. Because the widget itself decides when to resize, it always knows the
-/// frozen frame's size ([_committedSize]) — no produced-size feedback needed.
+/// the core at one size and shows that frozen frame 1:1, centred in the moving
+/// box (the engine keeps the camera centre across a resize, so the map neither
+/// moves nor stretches), pushing the real resize once the drag settles. The old
+/// frame stays up until the core reports a frame at the new size on screen
+/// ([MapLibreResizeMaskHint.presentedSize]), so the texture is never drawn at a
+/// size it was not rendered at.
 class _TextureMapView extends StatefulWidget {
   const _TextureMapView({required this.controller, required this.textureId});
 
@@ -297,26 +323,30 @@ class _TextureMapView extends StatefulWidget {
   State<_TextureMapView> createState() => _TextureMapViewState();
 }
 
-class _TextureMapViewState extends State<_TextureMapView> {
-  // Masked tiers only: the size the core is currently rendering — i.e. the size
-  // of the frame the texture is showing. We cover-fit this frozen frame to the
-  // (possibly different) box while a drag is in flight. Null until the first
-  // layout / on non-masked tiers (which resize live and render the bare texture).
+class _TextureMapViewState extends State<_TextureMapView>
+    with SingleTickerProviderStateMixin {
+  // Masked tiers only: the size of the frame the texture is showing (what the
+  // Texture is laid out at). Null until the first layout / on non-masked tiers
+  // (which resize live and render the bare texture).
   Size? _committedSize;
+  // A size sent to the core whose frame is not on screen yet.
+  Size? _pendingSize;
   Timer? _resizeDebounce;
+  Ticker? _presentWatch;
 
   @override
   void dispose() {
     _resizeDebounce?.cancel();
+    _presentWatch?.dispose();
     super.dispose();
   }
 
   // Drive the core's resize during layout (before paint), the desktop-core analog
   // of the web tier's ResizeObserver-driven resize. On masked tiers, debounce it
-  // during an active drag so the produced frame stays frozen at [_committedSize]
-  // (giving the cover-fit below a stable, known size to mask with) and apply the
-  // first sizing immediately so the map fills the window on load. Other tiers
-  // resize live every layout — their present catches up within ~a frame.
+  // during an active drag so the produced frame stays frozen at [_committedSize],
+  // and apply the first sizing immediately so the map fills the window on load.
+  // Other tiers resize live every layout — their present catches up within ~a
+  // frame.
   void _syncSize(Size size, double dpr) {
     if (!size.isFinite || size.isEmpty) return;
     if (!widget.controller.debounceResize) {
@@ -328,13 +358,39 @@ class _TextureMapViewState extends State<_TextureMapView> {
       widget.controller.resize(size, dpr);
       return;
     }
-    if (size == _committedSize) return;
+    if (size == (_pendingSize ?? _committedSize)) {
+      _resizeDebounce?.cancel();
+      return;
+    }
     _resizeDebounce?.cancel();
     _resizeDebounce = Timer(const Duration(milliseconds: 100), () {
       if (!mounted) return;
+      _pendingSize = size;
       widget.controller.resize(size, dpr);
-      setState(() => _committedSize = size);
+      _presentWatch ??= createTicker(_onPresentTick);
+      if (!_presentWatch!.isActive) _presentWatch!.start();
     });
+  }
+
+  // Swap to the new size once a frame rendered at it is on screen (or give up
+  // after a while, e.g. if the map stopped rendering).
+  void _onPresentTick(Duration elapsed) {
+    final pending = _pendingSize;
+    if (pending == null) {
+      _presentWatch?.stop();
+      return;
+    }
+    final shown = widget.controller.presentedSize;
+    final landed = shown != null &&
+        shown.width == pending.width.roundToDouble() &&
+        shown.height == pending.height.roundToDouble();
+    if (landed || elapsed > const Duration(seconds: 2)) {
+      _presentWatch?.stop();
+      setState(() {
+        _committedSize = pending;
+        _pendingSize = null;
+      });
+    }
   }
 
   @override
@@ -347,21 +403,36 @@ class _TextureMapViewState extends State<_TextureMapView> {
 
         Widget map = Texture(textureId: widget.textureId);
 
-        // Mask the resize stretch on lagging tiers: cover-fit the frozen frame
-        // (rendered at [_committedSize]) to the current box UNIFORMLY, so it crops
-        // slightly instead of stretching. In steady state _committedSize == box,
-        // so cover is an exact uniform scale (no crop) — identical to the bare
-        // texture. Gestures wrap OUTSIDE this fit stack so pointer coordinates stay
-        // in widget-box (logical) space.
+        // Mask the resize on lagging tiers: show the frozen frame (rendered at
+        // [_committedSize]) at its own size, centred in the current box and
+        // clipped — the engine keeps the camera centre on resize, so the frame
+        // that replaces it lines up exactly. Snapped to device pixels so the
+        // texture is not resampled. In steady state _committedSize == box and
+        // this is the bare texture. Gestures wrap OUTSIDE this stack so pointer
+        // coordinates stay in widget-box (logical) space; overlays convert with
+        // [MapLibreMapController.frameOffset].
         final committed = _committedSize;
         if (committed != null && size.isFinite && !size.isEmpty) {
+          double snap(double v) => (v * dpr).roundToDouble() / dpr;
+          final offset = Offset(snap((size.width - committed.width) / 2),
+              snap((size.height - committed.height) / 2));
+          // Read by overlay painters during this frame's paint (layout runs
+          // before paint), so the texture and the overlays move together.
+          widget.controller.frameOffset.value = offset;
           map = SizedBox.fromSize(
             size: size,
             child: ClipRect(
-              child: FittedBox(
-                fit: BoxFit.cover,
+              child: Stack(
                 clipBehavior: Clip.hardEdge,
-                child: SizedBox.fromSize(size: committed, child: map),
+                children: [
+                  Positioned(
+                    left: offset.dx,
+                    top: offset.dy,
+                    width: committed.width,
+                    height: committed.height,
+                    child: map,
+                  ),
+                ],
               ),
             ),
           );
@@ -739,6 +810,17 @@ class _DesktopMapGesturesState extends State<_DesktopMapGestures>
     super.dispose();
   }
 
+  // A map kept alive but not shown (under an Offstage — e.g. an MDI child hidden
+  // behind a maximized sibling) is never hit-tested, so without this check the
+  // global route would think an overlay blocked it and drive it from gestures
+  // aimed at the map that IS visible on top.
+  static bool _isOffstage(RenderObject ro) {
+    for (RenderObject? p = ro.parent; p != null; p = p.parent) {
+      if (p is RenderOffstage && p.offstage) return true;
+    }
+    return false;
+  }
+
   // True when [globalPos] hit-tests to this map's gesture box (so the normal
   // Listener/GestureDetector path will handle it and the global route must not).
   bool _hits(RenderBox box, Offset globalPos, int viewId) {
@@ -778,7 +860,7 @@ class _DesktopMapGesturesState extends State<_DesktopMapGestures>
     if (!isPanZoom && event is! PointerScrollEvent) return;
 
     final box = context.findRenderObject() as RenderBox?;
-    if (box == null || !box.hasSize) return;
+    if (box == null || !box.hasSize || _isOffstage(box)) return;
     final origin = box.localToGlobal(Offset.zero);
     final mapRect = origin & box.size;
     final cursor = _globalCursorPos ?? event.position; // prefer the true cursor
@@ -823,28 +905,18 @@ class _DesktopMapGesturesState extends State<_DesktopMapGestures>
       _blockedPanZoom = false;
       _inTrackpadPanZoom = false;
     } else if (event is PointerScrollEvent) {
-      // Local path handles it when the event routes to the map.
-      if (_hits(box, event.position, event.viewId)) return;
-      if (!mapRect.contains(cursor)) return;
-      _stopInertia();
-      final anchor = _blockedAnchorFor(box, origin, cursor, event.viewId);
-      final factor = math.pow(2.0, -event.scrollDelta.dy / 120.0).toDouble();
-      if (factor != 1.0) widget.handler.scaleBy(factor, anchor.dx, anchor.dy);
+      // Mouse-wheel zoom is owned by the app (SeeYou handles it about the true
+      // cursor via the projector); this global scroll fallback is disabled so
+      // the two never fight or double-apply.
+      return;
     }
   }
 
   void _onPointerSignal(PointerSignalEvent event) {
+    // Mouse-wheel zoom is owned by the app (see the global route note above);
+    // the engine no longer scroll-zooms here.
     if (event is PointerScrollEvent) {
-      _stopInertia(); // a scroll-zoom cancels any in-flight pan glide
-      // Scroll up (negative dy) zooms in, about the pointer.
-      final factor = math.pow(2.0, -event.scrollDelta.dy / 120.0).toDouble();
-      if (factor != 1.0) {
-        widget.handler.scaleBy(
-          factor,
-          event.localPosition.dx,
-          event.localPosition.dy,
-        );
-      }
+      _stopInertia(); // still cancel any in-flight pan glide
     }
   }
 

@@ -5,7 +5,7 @@
 library;
 
 export 'package:maplibre_flutter_platform_interface/maplibre_flutter_platform_interface.dart'
-    show LatLng, MapCamera, MapLibreModel, MapOptions;
+    show LatLng, MapCamera, MapLibreMapProjector, MapLibreModel, MapOptions;
 
 export 'src/map_layers_controller.dart';
 export 'src/maplibre_map.dart';

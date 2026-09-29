@@ -122,6 +122,12 @@ struct MblMap {
   std::condition_variable startCv;
   bool started = false;
 
+  // Startup-phase timing (MAPLIBRE_TIMING=1 env): creation time + render-thread
+  // counters for the first frames / first fully rendered frame.
+  std::chrono::steady_clock::time_point createdAt = std::chrono::steady_clock::now();
+  int timingFrames = 0;
+  bool timingFullLogged = false;
+
   // Latest rendered frame (RGBA premultiplied), guarded.
   std::mutex frameMutex;
   std::condition_variable frameCv;
@@ -240,8 +246,9 @@ struct MblMap {
   };
   std::unordered_map<std::string, ModelEntry> models;
 
-  // Current render-target size in device pixels (render thread only), used to size
-  // the GL presenter's ring to match each frame.
+  // Current map Size as passed to mbgl setSize (render thread only). NOTE: this is
+  // logical points when the host passes a real pixel ratio (Windows), so it is NOT
+  // the framebuffer size — present rings use framebufferSize() instead.
   uint32_t renderWidth = 0;
   uint32_t renderHeight = 0;
 
@@ -290,15 +297,12 @@ namespace {
 // new frame (CPU image or zero-copy IOSurface) has been published.
 void announceFrame(MblMap *m) {
   m->frameCv.notify_all();
-  MblFrameCallback cb = nullptr;
-  void *user = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(m->cbMutex);
-    cb = m->frameCb;
-    user = m->frameCbUser;
-  }
-  if (cb != nullptr) {
-    cb(user);
+  // Invoke UNDER cbMutex, so once mbl_map_set_frame_callback(nullptr) returns no
+  // call is in flight either: the host frees `user` right after unregistering it
+  // (the callback itself is only a thread-safe "frame available" mark — cheap).
+  std::lock_guard<std::mutex> lk(m->cbMutex);
+  if (m->frameCb != nullptr) {
+    m->frameCb(m->frameCbUser);
   }
 }
 
@@ -400,6 +404,18 @@ bool renderZeroCopyInner(MblMap *m) {
 #endif // __APPLE__
 
 #if !defined(__APPLE__)
+// mbgl's rendered frame size in DEVICE pixels: the map Size times the pixel ratio.
+// The present ring, the blit extent and the reported texture size must all use
+// THIS — not renderWidth/Height, which hold the map Size (logical points when the
+// host passes a real pixel ratio, as the Windows controller does). Sizing the ring
+// to the logical size made the blit copy only the top-left 1/pixelRatio of the
+// frame and stretch it over the widget: at 125% the map rendered magnified 1.25x
+// about its top-left while projection (markers, fit, cursor zoom) stayed correct.
+// The CPU path is unaffected (readStillImage carries the real image size).
+static mbgl::Size framebufferSize(MblMap *m) {
+  return m->frontend->getBackend()->getDefaultRenderable().getSize();
+}
+
 // Render thread, inside a BackendScope with mbgl's color renderable just bound.
 // Blits mbgl's FBO into the platform present ring and publishes the result under
 // frameMutex for the raster-thread getter. Returns false on failure (→ CPU).
@@ -409,11 +425,12 @@ bool presentZeroCopy(MblMap *m) {
   if (mbl_vk_presenter_present(m->vkPresenter, &handle) == 0) {
     return false;
   }
+  const mbgl::Size fb = framebufferSize(m);
   {
     std::lock_guard<std::mutex> lk(m->frameMutex);
     m->currentD3dHandle = handle;
-    m->d3dWidth = m->renderWidth;
-    m->d3dHeight = m->renderHeight;
+    m->d3dWidth = fb.width;
+    m->d3dHeight = fb.height;
     ++m->frameCount;
   }
 #else
@@ -437,16 +454,15 @@ bool presentZeroCopy(MblMap *m) {
 // false to fall back to CPU readback.
 bool presentZeroCopyAlreadyRendered(MblMap *m) {
   mbgl::gfx::BackendScope guard{*m->frontend->getBackend()};
+  const mbgl::Size fb = framebufferSize(m); // device px, see framebufferSize
 #if defined(_WIN32)
-  if (mbl_vk_presenter_resize(m->vkPresenter, m->renderWidth,
-                               m->renderHeight) == 0) {
+  if (mbl_vk_presenter_resize(m->vkPresenter, fb.width, fb.height) == 0) {
     return false;
   }
   // Vulkan: the present helper fetches mbgl's rendered image via the headless
   // renderable's getAcquiredImage() itself, so there is no GL FBO to bind here.
 #else
-  if (mbl_gl_presenter_resize(m->glPresenter, m->renderWidth, m->renderHeight) ==
-      0) {
+  if (mbl_gl_presenter_resize(m->glPresenter, fb.width, fb.height) == 0) {
     return false;
   }
   // GL: bind mbgl's color renderable so GL_DRAW_FRAMEBUFFER_BINDING is reliably its
@@ -589,6 +605,43 @@ uint64_t takeProjState(MblMap *m, uint64_t generation,
   return m->projGeneration;
 }
 
+// Startup-phase timing, printed to stderr when the MAPLIBRE_TIMING env var is set:
+// `[mbl-timing] <wall-clock ms> map=<ptr> +<ms since create> <event>`. Wall-clock
+// ms so it lines up with host-side logs.
+static bool timingEnabled() {
+  static const bool on = std::getenv("MAPLIBRE_TIMING") != nullptr;
+  return on;
+}
+static void timingLog(MblMap *m, const char *event, const std::string &extra = "") {
+  if (!timingEnabled()) return;
+  using namespace std::chrono;
+  const auto wall =
+      duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+  const auto since =
+      duration_cast<milliseconds>(steady_clock::now() - m->createdAt).count();
+  fprintf(stderr, "[mbl-timing] %lld map=%p +%lldms %s%s%s\n",
+          static_cast<long long>(wall), static_cast<void *>(m),
+          static_cast<long long>(since), event, extra.empty() ? "" : " ",
+          extra.c_str());
+  fflush(stderr);
+}
+
+// Process-wide resource cache path (mbl_set_cache_path). Empty = mbgl's default
+// ":memory:" cache, which dies with the process, so every launch re-downloaded the
+// style's sprite, glyphs and every tile. A file path makes it mbgl's persistent
+// ambient SQLite cache, shared by all maps (FileSourceManager keys sources by it).
+static std::mutex gCachePathMutex;
+static std::string gCachePath;
+
+static mbgl::ResourceOptions resourceOptions() {
+  auto options = mbgl::ResourceOptions::Default();
+  std::lock_guard<std::mutex> lk(gCachePathMutex);
+  if (!gCachePath.empty()) {
+    options.withCachePath(gCachePath);
+  }
+  return options;
+}
+
 // Cap the desktop core's online tile-request concurrency. The non-Apple core uses
 // the curl HTTP source, which multiplexes mbgl's default 20 concurrent requests
 // onto one HTTP/2 connection; community tile servers (demotiles, OpenFreeMap)
@@ -608,23 +661,30 @@ void capDesktopRequestConcurrency() {
     }
   }
   if (auto fs = mbgl::FileSourceManager::get()->getFileSource(
-          mbgl::FileSourceType::Network, mbgl::ResourceOptions::Default(),
+          mbgl::FileSourceType::Network, resourceOptions(),
           mbgl::ClientOptions())) {
     fs->setProperty(mbgl::MAX_CONCURRENT_REQUESTS_KEY, maxRequests);
   }
 #endif
 }
 
+// Each map's render thread MUST own a private RunLoop (Type::New). The default
+// constructor (Type::Default) binds to libuv's process-wide uv_default_loop(), so
+// with two maps open both render threads ran uv_run() on the SAME loop — libuv is
+// single-threaded, and each thread executed the other map's renders/readbacks
+// concurrently with its owner: heap corruption crashing in the GPU driver,
+// memcpy or here (two flight windows open -> crash). mbgl's own worker threads
+// (util::Thread) use Type::New for the same reason.
 void renderThreadMain(MblMap *m, uint32_t width, uint32_t height,
                       float pixelRatio, std::string styleUri) {
-  mbgl::util::RunLoop loop;
+  mbgl::util::RunLoop loop(mbgl::util::RunLoop::Type::New);
   mbgl::HeadlessFrontend frontend(mbgl::Size{width, height}, pixelRatio);
   mbgl::Map map(frontend, mbgl::MapObserver::nullObserver(),
                 mbgl::MapOptions()
                     .withMapMode(mbgl::MapMode::Static)
                     .withSize(mbgl::Size{width, height})
                     .withPixelRatio(pixelRatio),
-                mbgl::ResourceOptions::Default());
+                resourceOptions());
 
   m->frontend = &frontend;
   m->map = &map;
@@ -850,8 +910,21 @@ void requestModelRender(MblMap *m);
 class FrameObserver final : public mbgl::MapObserver {
 public:
   explicit FrameObserver(MblMap *map) : m(map) {}
-  void onDidFinishRenderingFrame(const RenderFrameStatus &) override {
+  void onDidFinishRenderingFrame(const RenderFrameStatus &s) override {
+    if (timingEnabled() && m->timingFrames < 6) {
+      ++m->timingFrames;
+      char buf[64];
+      snprintf(buf, sizeof buf, "#%d full=%d", m->timingFrames,
+               s.mode == RenderMode::Full ? 1 : 0);
+      timingLog(m, "frame", buf);
+    }
     publishCurrentFrame(m);
+  }
+  void onDidFinishRenderingMap(RenderMode mode) override {
+    if (mode == RenderMode::Full && !m->timingFullLogged) {
+      m->timingFullLogged = true;
+      timingLog(m, "fully-rendered");
+    }
   }
 
   // A freshly loaded style throws away two things we have to put back.
@@ -866,6 +939,7 @@ public:
   // re-add by hand. Free: the parsed mesh is retained and shared, so nothing is
   // re-read or re-parsed.
   void onDidFinishLoadingStyle() override {
+    timingLog(m, "style-loaded");
     applyTransitionOptions(m);
     for (const auto &entry : m->models) {
       addModelLayerNow(m, entry.first, entry.second.mesh, entry.second.gpu,
@@ -882,7 +956,9 @@ private:
 
 void renderThreadMainContinuous(MblMap *m, uint32_t width, uint32_t height,
                                 float pixelRatio, std::string styleUri) {
-  mbgl::util::RunLoop loop;
+  // Private loop per render thread — see renderThreadMain.
+  mbgl::util::RunLoop loop(mbgl::util::RunLoop::Type::New);
+  timingLog(m, "thread-start");
   FrameObserver observer(m);
   // Continuous mode: render partial frames immediately and refine as tiles load
   // (invalidateOnUpdate drives renderFrame off the loop; Flush per the upstream
@@ -891,12 +967,14 @@ void renderThreadMainContinuous(MblMap *m, uint32_t width, uint32_t height,
       mbgl::Size{width, height}, pixelRatio,
       mbgl::gfx::HeadlessBackend::SwapBehaviour::Flush,
       mbgl::gfx::ContextMode::Unique, std::nullopt, /*invalidateOnUpdate=*/true);
+  timingLog(m, "frontend(vulkan)-created");
   mbgl::Map map(frontend, observer,
                 mbgl::MapOptions()
                     .withMapMode(mbgl::MapMode::Continuous)
                     .withSize(mbgl::Size{width, height})
                     .withPixelRatio(pixelRatio),
-                mbgl::ResourceOptions::Default());
+                resourceOptions());
+  timingLog(m, "map-created");
 
   m->frontend = &frontend;
   m->map = &map;
@@ -913,6 +991,7 @@ void renderThreadMainContinuous(MblMap *m, uint32_t width, uint32_t height,
       map.getStyle().loadURL(styleUri);
     }
   }
+  timingLog(m, "style-parse-called");
   m->renderLoop = &loop;
 
   {
@@ -1700,6 +1779,26 @@ uint64_t mbl_map_proj_generation(MblMap *m) {
   return m->projGeneration;
 }
 
+void mbl_map_presented_size(MblMap *m, uint32_t *out_width,
+                            uint32_t *out_height) {
+  if (out_width != nullptr) *out_width = 0;
+  if (out_height != nullptr) *out_height = 0;
+  if (m == nullptr || out_width == nullptr || out_height == nullptr) {
+    return;
+  }
+  uint64_t gen;
+  {
+    std::lock_guard<std::mutex> lk(m->projMutex);
+    gen = m->presentedGeneration;
+  }
+  if (gen == 0) return;
+  mbgl::TransformState ts;
+  if (takeProjState(m, gen, ts) == 0) return;
+  const mbgl::Size s = ts.getSize();
+  *out_width = s.width;
+  *out_height = s.height;
+}
+
 void mbl_map_set_frame_callback(MblMap *m, MblFrameCallback callback,
                                 void *user) {
   if (m == nullptr) {
@@ -1938,6 +2037,27 @@ int mbl_map_write_png(MblMap *m, const char *path) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   out.write(png.data(), static_cast<std::streamsize>(png.size()));
   return out.good() ? 1 : 0;
+}
+
+void mbl_set_cache_path(const char *path) {
+  std::lock_guard<std::mutex> lk(gCachePathMutex);
+  gCachePath = path != nullptr ? path : "";
+}
+
+void mbl_prewarm(void) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      // A throwaway 8x8, style-less map: building its backend creates the shared
+      // VkInstance (kept for the process), so it no longer lands on the first real
+      // map's — i.e. the user's — clock. If a real map starts meanwhile it simply
+      // waits for the same one-time creation instead of repeating it.
+      MblMap *warm = mbl_map_create(8, 8, 1.0f, "", 1);
+      if (warm != nullptr) {
+        mbl_map_destroy(warm);
+      }
+    }).detach();
+  });
 }
 
 void mbl_map_destroy(MblMap *m) {
