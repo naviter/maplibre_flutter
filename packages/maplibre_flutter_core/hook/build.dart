@@ -38,6 +38,13 @@ void main(List<String> args) async {
     }
 
     final packageRoot = input.packageRoot;
+    // A ready-made binary dropped into prebuilt/<os>-<arch>/ (an app's CI that
+    // keeps its own per-revision binaries) wins over every other path, the
+    // vendored source included. MAPLIBRE_FLUTTER_BUILD_FROM_SOURCE=1 skips it.
+    if (Platform.environment['MAPLIBRE_FLUTTER_BUILD_FROM_SOURCE'] != '1' &&
+        _tryLocalPrebuilt(input, output, logger)) {
+      return;
+    }
     final submodule = Directory.fromUri(
       packageRoot.resolve('third_party/maplibre-native/'),
     );
@@ -428,6 +435,63 @@ const _releaseBaseUrl =
 /// Tries to download + register a prebuilt core binary for the target os/arch.
 /// Returns true if a prebuilt was used; false (or on any error) to fall back to
 /// a source build. Integrity rests on HTTPS to the trusted release host.
+/// A binary at `prebuilt/<os>-<arch>/<lib>` in the package (not in git; put
+/// there by an app's own prebuilt cache, e.g. SeeYou's Flutter/tool/
+/// prebuilts.py) with `<lib>.key` matching this package's sources: the git
+/// tree hash of the package at HEAD (first 16 characters). Registered as the
+/// code asset, nothing built. Uncommitted changes (the vendored submodule's
+/// own changes aside) or no git: no key, so the source is built.
+bool _tryLocalPrebuilt(
+  BuildInput input,
+  BuildOutputBuilder output,
+  Logger logger,
+) {
+  final os = input.config.code.targetOS;
+  final arch = input.config.code.targetArchitecture;
+  final libName = os.dylibFileName(input.packageName);
+  final dir = input.packageRoot.resolve('prebuilt/${os.name}-${arch.name}/');
+  final file = File.fromUri(dir.resolve(libName));
+  final keyFile = File.fromUri(dir.resolve('$libName.key'));
+  if (!file.existsSync() || !keyFile.existsSync()) return false;
+  final root = input.packageRoot.toFilePath();
+  String? git(List<String> args) {
+    try {
+      final r = Process.runSync('git', ['-C', root, ...args]);
+      return r.exitCode == 0 ? (r.stdout as String).trim() : null;
+    } on ProcessException {
+      return null;
+    }
+  }
+
+  final status = git(['status', '--porcelain', '--ignore-submodules=dirty', '--', './']);
+  final tree = git(['rev-parse', 'HEAD:./']);
+  final key = status == null || status.isNotEmpty || tree == null || tree.length < 16
+      ? null
+      : tree.substring(0, 16);
+  if (key == null || keyFile.readAsStringSync().trim() != key) {
+    logger.info('maplibre_flutter_core: the local prebuilt is for other sources; building');
+    return false;
+  }
+  final dest = File.fromUri(input.outputDirectory.resolve(libName));
+  dest.parent.createSync(recursive: true);
+  file.copySync(dest.path);
+  output.dependencies
+    ..add(file.uri)
+    ..add(keyFile.uri)
+    ..add(input.packageRoot.resolve('hook/build.dart'))
+    ..add(input.packageRoot.resolve('src/CMakeLists.txt'));
+  output.assets.code.add(
+    CodeAsset(
+      package: input.packageName,
+      name: 'src/${input.packageName}_bindings_generated.dart',
+      linkMode: DynamicLoadingBundled(),
+      file: dest.uri,
+    ),
+  );
+  logger.info('maplibre_flutter_core: using the local prebuilt ${file.path} ($key)');
+  return true;
+}
+
 Future<bool> _tryPrebuilt(
   BuildInput input,
   BuildOutputBuilder output,
