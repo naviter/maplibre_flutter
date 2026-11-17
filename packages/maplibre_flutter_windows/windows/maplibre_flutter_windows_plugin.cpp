@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace {
@@ -236,6 +237,17 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
         std::lock_guard<std::mutex> lock(registered_mutex_);
         registered_[id] = std::move(t);
       }
+      // One line per map in the host's native log: how it reaches the screen.
+      {
+        std::string reason = "?";
+        auto r = args->find(EncodableValue(std::string("reason")));
+        if (r != args->end()) {
+          if (auto s = std::get_if<std::string>(&r->second)) reason = *s;
+        }
+        fprintf(stderr,
+                "maplibre_flutter_windows: map texture %lld: CPU readback (%s)\n",
+                static_cast<long long>(id), reason.c_str());
+      }
       result->Success(EncodableValue(id));
     } else if (method == "registerTextureGpu") {
       // Zero-copy: present mbgl's frame as a Flutter GpuSurfaceTexture backed by a
@@ -295,6 +307,10 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
         std::lock_guard<std::mutex> lock(registered_mutex_);
         registered_[id] = std::move(t);
       }
+      fprintf(stderr,
+              "maplibre_flutter_windows: map texture %lld: zero-copy (D3D11 "
+              "shared texture)\n",
+              static_cast<long long>(id));
       result->Success(EncodableValue(id));
     } else if (method == "unregisterTexture") {
       const auto* id_v = std::get_if<int64_t>(call.arguments());

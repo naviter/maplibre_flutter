@@ -147,8 +147,12 @@ class MapLibreFlutterWindowsController
       // RGBA (the plugin's FlutterDesktopPixelBuffer is RGBA), and the native
       // plugin reads each frame over FFI via `mbl_map_copy_frame`.
       coreMap.setPixelFormatBgra(false);
+      // The plugin writes the path and [why] to the native log (stderr in
+      // C++: Dart's own stderr is the engine's, which a GUI app's host
+      // cannot redirect - writing to it failed with an invalid handle).
       textureId = await _registrar
           .invokeMethod<int>('registerTexture', <String, Object?>{
+            'reason': why.isEmpty ? 'zero-copy off' : why,
             'mapHandle': coreMap.nativeAddress,
             'copyFrameFn': core.MapLibreCoreMap.copyFrameFunctionAddress,
             'setFrameCallbackFn':
@@ -157,19 +161,6 @@ class MapLibreFlutterWindowsController
     }
 
     _timingLog('create: texture registered (id=$textureId)');
-    // One line per map into the native log (stderr; SeeYou keeps it with its
-    // logs), so a report says how this machine's maps reach the screen. Only
-    // to a real stderr: a GUI app without one fails the write asynchronously.
-    try {
-      if (io.stdioType(io.stderr) != io.StdioType.other) {
-        io.stderr.writeln(
-          'maplibre_flutter_windows: map texture $textureId: '
-          '${why.isEmpty ? 'zero-copy (D3D11 shared texture)' : 'CPU readback ($why)'}',
-        );
-      }
-    } on Object {
-      // no stderr
-    }
     return MapLibreFlutterWindowsController._(coreMap, textureId ?? -1);
   }
 
