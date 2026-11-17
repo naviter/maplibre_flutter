@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:ffi' as ffi;
 import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:ffi/ffi.dart' as pffi;
 import 'package:flutter/services.dart';
 import 'package:maplibre_flutter_core/maplibre_flutter_core.dart' as core;
 import 'package:maplibre_flutter_platform_interface/maplibre_flutter_platform_interface.dart';
@@ -118,9 +120,17 @@ class MapLibreFlutterWindowsController
     int? textureId;
     if (wantZeroCopy) {
       coreMap.setZeroCopy(true);
-      final zc = await _confirmZeroCopyActive(coreMap);
+      var zc = await _confirmZeroCopyActive(coreMap);
       _timingLog('create: zero-copy probe done (active=$zc)');
       if (!zc) why = 'no GPU presenter (the reason is logged above)';
+      // The presenter can come up and still fail its first present (an Intel
+      // GPU that cannot import the legacy D3D11 shared handle): the core then
+      // renders through the CPU, and a GPU texture would never get a frame -
+      // a blank map. Register the texture the first frame actually took.
+      if (zc && await _firstFrameIsD3d(coreMap) == false) {
+        zc = false;
+        why = 'the GPU could not share the frame (the reason is logged above)';
+      }
       if (zc) {
         try {
           textureId = await _registrar
@@ -162,6 +172,31 @@ class MapLibreFlutterWindowsController
 
     _timingLog('create: texture registered (id=$textureId)');
     return MapLibreFlutterWindowsController._(coreMap, textureId ?? -1);
+  }
+
+  /// Whether the first frame (up to 5 s) arrived as a D3D shared texture;
+  /// null when none came in time (left as it is).
+  static Future<bool?> _firstFrameIsD3d(core.MapLibreCoreMap coreMap) async {
+    final wait = Stopwatch()..start();
+    while (!coreMap.awaitFrame(Duration.zero)) {
+      if (wait.elapsed > const Duration(seconds: 5)) return null;
+      await Future<void>.delayed(const Duration(milliseconds: 8));
+    }
+    final current = ffi.Pointer<ffi.NativeFunction<_CurrentD3dNative>>.fromAddress(
+      core.MapLibreCoreMap.currentD3dHandleFunctionAddress,
+    ).asFunction<_CurrentD3d>();
+    final out = pffi.calloc<ffi.Pointer<ffi.Void>>();
+    try {
+      final ok = current(
+        ffi.Pointer<ffi.Void>.fromAddress(coreMap.nativeAddress),
+        out,
+        ffi.nullptr,
+        ffi.nullptr,
+      );
+      return ok != 0 && out.value != ffi.nullptr;
+    } finally {
+      pffi.calloc.free(out);
+    }
   }
 
   /// Polls (up to ~1s) for the native D3D presenter to come up after
@@ -455,3 +490,17 @@ class MapLibreFlutterWindowsController
     _coreMap.dispose();
   }
 }
+
+/// `mbl_map_current_d3d_handle(map, out_handle, out_width, out_height)`.
+typedef _CurrentD3dNative = ffi.Int32 Function(
+  ffi.Pointer<ffi.Void>,
+  ffi.Pointer<ffi.Pointer<ffi.Void>>,
+  ffi.Pointer<ffi.Uint32>,
+  ffi.Pointer<ffi.Uint32>,
+);
+typedef _CurrentD3d = int Function(
+  ffi.Pointer<ffi.Void>,
+  ffi.Pointer<ffi.Pointer<ffi.Void>>,
+  ffi.Pointer<ffi.Uint32>,
+  ffi.Pointer<ffi.Uint32>,
+);
