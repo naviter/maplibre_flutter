@@ -216,6 +216,18 @@ Future<void> _applySubmodulePatches(
       marker: 'MBL_SHARED_VK_INSTANCE',
       patch: 'patches/windows-vulkan-shared-instance.patch',
     ),
+    // Render on the host's GPU. mbgl took the first suitable Vulkan device; on a
+    // laptop with two GPUs that can be another adapter than the one Flutter draws
+    // with, and the D3D11 shared texture of the zero-copy present cannot be opened
+    // across adapters — a blank map, no error. A suitable device with the LUID in
+    // MBL_VK_ADAPTER_LUID (set by maplibre_flutter_windows from the Flutter view)
+    // now wins; every device and the choice are logged (stderr). MUST come after
+    // the two patches above (same file).
+    (
+      file: 'src/mbgl/vulkan/renderer_backend.cpp',
+      marker: 'MBL_VK_PREFERRED_ADAPTER',
+      patch: 'patches/windows-vulkan-preferred-adapter.patch',
+    ),
     // Resource cache database in WAL mode with NORMAL sync. Every cache read updates
     // an `accessed` timestamp in its own transaction; with mbgl's DELETE journal +
     // FULL sync each one was a journal-file fsync, so a persistent (on-disk) cache

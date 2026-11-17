@@ -284,6 +284,29 @@ MblVkPresenter *mbl_vk_presenter_create(void *backend) {
     static_assert(sizeof(luid) == VK_LUID_SIZE, "LUID size mismatch");
     std::memcpy(&luid, idProps.deviceLUID.data(), VK_LUID_SIZE);
 
+    // The shared texture is opened by the host (Flutter's ANGLE) on ITS adapter; a
+    // texture made on another adapter cannot be opened there and the map would stay
+    // blank without an error. maplibre_flutter_windows names the Flutter view's
+    // adapter in MBL_VK_ADAPTER_LUID and mbgl prefers that device
+    // (windows-vulkan-preferred-adapter.patch); when it still differs (no suitable
+    // Vulkan device on Flutter's adapter), present through the CPU instead.
+    {
+      char want[32] = {};
+      const DWORD n =
+          GetEnvironmentVariableA("MBL_VK_ADAPTER_LUID", want, sizeof(want));
+      char have[20];
+      std::snprintf(have, sizeof(have), "%08lx%08lx",
+                    static_cast<unsigned long>(luid.HighPart),
+                    static_cast<unsigned long>(luid.LowPart));
+      if (n > 0 && n < sizeof(want) && std::strcmp(want, have) != 0) {
+        fprintf(stderr,
+                "maplibre_flutter_core: the map renders on another GPU (LUID %s) "
+                "than Flutter (LUID %s); using CPU readback.\n",
+                have, want);
+        return nullptr;
+      }
+    }
+
     IDXGIAdapter1 *adapter = nullptr;
     if (FAILED(factory->EnumAdapterByLuid(
             luid, __uuidof(IDXGIAdapter1),

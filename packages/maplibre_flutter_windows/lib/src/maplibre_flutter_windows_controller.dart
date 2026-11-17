@@ -106,16 +106,21 @@ class MapLibreFlutterWindowsController
     // GPU texture only once the native presenter confirms it initialised
     // ([isZeroCopyActive]); otherwise (or if registration fails, e.g. a driver that
     // can't import the legacy D3D11 shared handle) we fall back to the CPU
-    // PixelBufferTexture path, so the map still renders.
-    const wantZeroCopy = bool.fromEnvironment(
-      'MAPLIBRE_ZEROCOPY',
-      defaultValue: true,
-    );
+    // PixelBufferTexture path, so the map still renders. MAPLIBRE_ZEROCOPY=0 in
+    // the environment does the same at run time (support: a machine whose GPU
+    // path misbehaves, without a special build).
+    final wantZeroCopy =
+        const bool.fromEnvironment('MAPLIBRE_ZEROCOPY', defaultValue: true) &&
+        !const {'0', 'false', 'off'}.contains(
+          io.Platform.environment['MAPLIBRE_ZEROCOPY']?.toLowerCase(),
+        );
+    var why = wantZeroCopy ? '' : 'MAPLIBRE_ZEROCOPY off';
     int? textureId;
     if (wantZeroCopy) {
       coreMap.setZeroCopy(true);
       final zc = await _confirmZeroCopyActive(coreMap);
       _timingLog('create: zero-copy probe done (active=$zc)');
+      if (!zc) why = 'no GPU presenter (the reason is logged above)';
       if (zc) {
         try {
           textureId = await _registrar
@@ -126,12 +131,14 @@ class MapLibreFlutterWindowsController
                 'setFrameCallbackFn':
                     core.MapLibreCoreMap.setFrameCallbackFunctionAddress,
               });
-        } catch (_) {
+        } catch (e) {
           textureId = null;
+          why = 'registerTextureGpu failed: $e';
         }
       }
       if (textureId == null || textureId < 0) {
         coreMap.setZeroCopy(false); // unavailable / failed → CPU fallback
+        if (why.isEmpty) why = 'registerTextureGpu gave $textureId';
       }
     }
 
@@ -150,6 +157,19 @@ class MapLibreFlutterWindowsController
     }
 
     _timingLog('create: texture registered (id=$textureId)');
+    // One line per map into the native log (stderr; SeeYou keeps it with its
+    // logs), so a report says how this machine's maps reach the screen. Only
+    // to a real stderr: a GUI app without one fails the write asynchronously.
+    try {
+      if (io.stdioType(io.stderr) != io.StdioType.other) {
+        io.stderr.writeln(
+          'maplibre_flutter_windows: map texture $textureId: '
+          '${why.isEmpty ? 'zero-copy (D3D11 shared texture)' : 'CPU readback ($why)'}',
+        );
+      }
+    } on Object {
+      // no stderr
+    }
     return MapLibreFlutterWindowsController._(coreMap, textureId ?? -1);
   }
 

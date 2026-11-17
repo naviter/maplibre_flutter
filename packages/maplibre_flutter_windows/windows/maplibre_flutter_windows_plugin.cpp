@@ -17,7 +17,11 @@
 #include <flutter/standard_method_codec.h>
 #include <flutter/texture_registrar.h>
 
+#include <windows.h>
+#include <dxgi.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,6 +45,42 @@ typedef void (*MblSetFrameCallbackFn)(void* map, MblFrameCallback cb,
 // (mbl_map_current_d3d_handle). Returns 0 if no zero-copy frame is available.
 typedef int (*MblCurrentD3dHandleFn)(void* map, void** out_handle, uint32_t* w,
                                      uint32_t* h);
+
+// Names the Flutter view's GPU for the core: MBL_VK_ADAPTER_LUID ("%08lx%08lx",
+// HighPart then LowPart), read when a map picks its Vulkan device (mbgl prefers
+// that adapter: windows-vulkan-preferred-adapter.patch) and by the zero-copy
+// presenter, which presents through the CPU when the map's GPU still differs: a
+// D3D11 shared texture made on one adapter cannot be opened on another, and on a
+// laptop with two GPUs that left the map blank. "none" when Flutter has no D3D
+// adapter (software rendering): the CPU path then. The adapter also goes to
+// stderr, so a log says which GPU Flutter drew with.
+void NoteFlutterAdapter(flutter::PluginRegistrarWindows* registrar) {
+  IDXGIAdapter* adapter = nullptr;  // owned (GetAdapter's reference)
+  if (!registrar->GetGraphicsAdapter(&adapter)) adapter = nullptr;
+  DXGI_ADAPTER_DESC desc{};
+  if (adapter == nullptr || FAILED(adapter->GetDesc(&desc))) {
+    if (adapter != nullptr) adapter->Release();
+    ::SetEnvironmentVariableA("MBL_VK_ADAPTER_LUID", "none");
+    fprintf(stderr,
+            "maplibre_flutter_windows: Flutter has no D3D adapter (software "
+            "rendering?); maps present through the CPU.\n");
+    return;
+  }
+  adapter->Release();
+  char luid[20];
+  snprintf(luid, sizeof(luid), "%08lx%08lx",
+           static_cast<unsigned long>(desc.AdapterLuid.HighPart),
+           static_cast<unsigned long>(desc.AdapterLuid.LowPart));
+  ::SetEnvironmentVariableA("MBL_VK_ADAPTER_LUID", luid);
+  char name[256] = "?";
+  ::WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name),
+                        nullptr, nullptr);
+  fprintf(stderr,
+          "maplibre_flutter_windows: Flutter renders on %s (vendor 0x%04x, "
+          "device 0x%04x, %llu MB, LUID %s)\n",
+          name, desc.VendorId, desc.DeviceId,
+          static_cast<unsigned long long>(desc.DedicatedVideoMemory >> 20), luid);
+}
 
 int64_t ArgInt(const EncodableMap& m, const char* key) {
   auto it = m.find(EncodableValue(std::string(key)));
@@ -98,6 +138,7 @@ class MaplibreFlutterWindowsPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(
       flutter::PluginRegistrarWindows* registrar) {
+    NoteFlutterAdapter(registrar);
     auto plugin = std::make_unique<MaplibreFlutterWindowsPlugin>(registrar);
     auto channel = std::make_unique<flutter::MethodChannel<EncodableValue>>(
         registrar->messenger(), "maplibre_flutter/windows/registrar",

@@ -1,0 +1,123 @@
+--- a/src/mbgl/vulkan/renderer_backend.cpp
++++ b/src/mbgl/vulkan/renderer_backend.cpp
+@@ -29,6 +29,9 @@
+ #include <mbgl/shaders/vulkan/widevector.hpp>
+ 
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <mutex>
+ #include <string>
+ 
+@@ -594,18 +597,105 @@
+         return true;
+     };
+ 
++    // MBL_VK_PREFERRED_ADAPTER (maplibre_flutter committed patch): render on the GPU the
++    // host draws with. On a laptop with two GPUs (Intel + NVIDIA) the first suitable
++    // Vulkan device can be a different adapter than the one Flutter's ANGLE uses, and
++    // a D3D11 shared texture made on one adapter cannot be opened on the other — the
++    // map then stays blank without an error. The host names its adapter's LUID in
++    // MBL_VK_ADAPTER_LUID ("%08x%08x", HighPart then LowPart; maplibre_flutter_windows
++    // sets it from the Flutter view); a suitable device with that LUID wins, else the
++    // first suitable one as before. Every device and the choice go to the log (stderr),
++    // so a report says which GPUs there were and which one the map used.
+     const auto& pickPhysicalDevice = [&]() {
+         const auto& physicalDevices = instance->enumeratePhysicalDevices(dispatcher);
+         if (physicalDevices.empty()) throw std::runtime_error("No Vulkan compatible GPU found");
+ 
+-        for (const auto& candidate : physicalDevices) {
+-            if (isPhysicalDeviceCompatible(candidate)) {
+-                physicalDevice = candidate;
+-                break;
++        std::string wantLuid;
++#ifdef _WIN32
++        {
++            char* v = nullptr;
++            size_t len = 0;
++            if (_dupenv_s(&v, &len, "MBL_VK_ADAPTER_LUID") == 0 && v != nullptr) {
++                wantLuid = v;
++                free(v);
+             }
+         }
++#endif
++        const auto luidOf = [&](const vk::PhysicalDevice& d) -> std::string {
++            if (!dispatcher.vkGetPhysicalDeviceProperties2KHR) return {};
++            vk::PhysicalDeviceIDProperties id;
++            vk::PhysicalDeviceProperties2 p2;
++            p2.pNext = &id;
++            d.getProperties2KHR(&p2, dispatcher);
++            if (!id.deviceLUIDValid) return {};
++            uint32_t low = 0;
++            uint32_t high = 0;
++            std::memcpy(&low, id.deviceLUID.data(), 4);
++            std::memcpy(&high, id.deviceLUID.data() + 4, 4);
++            char buf[20];
++            std::snprintf(buf, sizeof buf, "%08x%08x", high, low);
++            return buf;
++        };
++        const auto typeName = [](vk::PhysicalDeviceType t) -> const char* {
++            switch (t) {
++                case vk::PhysicalDeviceType::eIntegratedGpu:
++                    return "integrated";
++                case vk::PhysicalDeviceType::eDiscreteGpu:
++                    return "discrete";
++                case vk::PhysicalDeviceType::eVirtualGpu:
++                    return "virtual";
++                case vk::PhysicalDeviceType::eCpu:
++                    return "CPU";
++                default:
++                    return "other";
++            }
++        };
+ 
+-        if (!physicalDevice) throw std::runtime_error("No suitable GPU found");
++        int chosen = -1;
++        bool chosenMatches = false;
++        for (size_t i = 0; i < physicalDevices.size(); ++i) {
++            const auto& candidate = physicalDevices[i];
++            const auto props = candidate.getProperties(dispatcher);
++            const bool suitable = isPhysicalDeviceCompatible(candidate);
++            const std::string luid = luidOf(candidate);
++            const bool matches = !wantLuid.empty() && luid == wantLuid;
++            char line[512];
++            std::snprintf(line,
++                          sizeof line,
++                          "Vulkan device %u: %s (%s, Vulkan %u.%u.%u, driver 0x%08x, vendor 0x%04x, device 0x%04x, "
++                          "LUID %s)%s%s",
++                          static_cast<unsigned>(i),
++                          props.deviceName.data(),
++                          typeName(props.deviceType),
++                          VK_API_VERSION_MAJOR(props.apiVersion),
++                          VK_API_VERSION_MINOR(props.apiVersion),
++                          VK_API_VERSION_PATCH(props.apiVersion),
++                          props.driverVersion,
++                          props.vendorID,
++                          props.deviceID,
++                          luid.empty() ? "?" : luid.c_str(),
++                          suitable ? "" : ", not suitable",
++                          matches ? ", the host's adapter" : "");
++            mbgl::Log::Info(mbgl::Event::Render, line);
++            if (suitable && (chosen < 0 || (matches && !chosenMatches))) {
++                chosen = static_cast<int>(i);
++                chosenMatches = matches;
++            }
++        }
++
++        if (chosen < 0) throw std::runtime_error("No suitable GPU found");
++        physicalDevice = physicalDevices[chosen];
++        // isPhysicalDeviceCompatible sets the queue indices of the device it checks.
++        isPhysicalDeviceCompatible(physicalDevice);
++        const std::string name = physicalDevice.getProperties(dispatcher).deviceName.data();
++        if (!wantLuid.empty() && !chosenMatches) {
++            mbgl::Log::Warning(mbgl::Event::Render,
++                               "Vulkan renders on device " + std::to_string(chosen) + " (" + name +
++                                   "): no suitable Vulkan device on the host's adapter (LUID " + wantLuid + ")");
++        } else {
++            mbgl::Log::Info(mbgl::Event::Render,
++                            "Vulkan renders on device " + std::to_string(chosen) + " (" + name + ")");
++        }
+     };
+ 
+     pickPhysicalDevice();
