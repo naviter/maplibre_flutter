@@ -61,6 +61,22 @@ class _FakeGestureController extends _FakeController
       scaleCalls.add((scale: scale, anchor: Offset(anchorX, anchorY)));
 }
 
+/// A controller whose texture lags the widget box (the Windows CPU present):
+/// the widget debounces resizes and masks them. The frame on screen takes the
+/// size of the last resize at once.
+class _FakeMaskController extends _FakeController
+    implements MapLibreResizeMaskHint {
+  _FakeMaskController(super.renderHandle);
+  final List<Size> resizes = <Size>[];
+  @override
+  Size? presentedSize;
+  @override
+  Future<void> resize(Size size, double devicePixelRatio) async {
+    resizes.add(size);
+    presentedSize = size;
+  }
+}
+
 class _FakePlatform extends MapLibreFlutterPlatform {
   _FakePlatform(this.handle, {this.gestures = false});
   final MapLibreRenderHandle handle;
@@ -335,6 +351,45 @@ void main() {
     expect(host.added.length, 2, reason: 'a different mesh must be re-read');
     expect(host.updated, isEmpty);
   });
+
+  testWidgets(
+    'a masked resize lands while the parent rebuilds every frame',
+    (tester) async {
+      // Regression: each rebuild restarted the resize debounce, so a map in a
+      // parent that rebuilds every frame (a replay) never got its new size:
+      // the old, smaller frame stayed centred in the new box.
+      final platform = _FakePlatform(const TextureHandle(textureId: 11));
+      platform.controllerFactory = _FakeMaskController.new;
+      MapLibreFlutterPlatform.instance = platform;
+
+      Widget map(Size size) => Directionality(
+        textDirection: TextDirection.ltr,
+        child: Center(
+          child: SizedBox.fromSize(
+            size: size,
+            // Not const: a new widget each time, as from a parent's build.
+            // ignore: prefer_const_constructors
+            child: MapLibreMap(style: _style, options: _options),
+          ),
+        ),
+      );
+
+      const a = Size(178, 110), b = Size(220, 136);
+      await tester.pumpWidget(map(a));
+      await tester.pumpAndSettle();
+      final c = platform.lastController! as _FakeMaskController;
+      expect(c.resizes, <Size>[a]);
+
+      // The new size, then a new widget every frame for 0.5 s.
+      for (var i = 0; i < 30; i++) {
+        await tester.pumpWidget(map(b), duration: const Duration(milliseconds: 16));
+      }
+      expect(c.resizes, <Size>[a, b]);
+      await tester.pumpAndSettle();
+      // The frame of the new size fills the box.
+      expect(tester.getSize(find.byType(Texture)), b);
+    },
+  );
 
   testWidgets('a gesture-capable controller gets the Dart gesture layer', (
     tester,

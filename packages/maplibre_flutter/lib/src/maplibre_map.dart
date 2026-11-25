@@ -331,6 +331,8 @@ class _TextureMapViewState extends State<_TextureMapView>
   Size? _committedSize;
   // A size sent to the core whose frame is not on screen yet.
   Size? _pendingSize;
+  // The size the running [_resizeDebounce] will send.
+  Size? _debouncedSize;
   Timer? _resizeDebounce;
   Ticker? _presentWatch;
 
@@ -362,6 +364,13 @@ class _TextureMapViewState extends State<_TextureMapView>
       _resizeDebounce?.cancel();
       return;
     }
+    // A rebuild at the size the timer already waits for (a parent that
+    // rebuilds every frame, e.g. an animation or a replay) must not restart
+    // the timer: only a new size does. Otherwise the resize never fires while
+    // the parent keeps rebuilding, and the old frame stays up for good,
+    // centred in a box of another size.
+    if (size == _debouncedSize && (_resizeDebounce?.isActive ?? false)) return;
+    _debouncedSize = size;
     _resizeDebounce?.cancel();
     _resizeDebounce = Timer(const Duration(milliseconds: 100), () {
       if (!mounted) return;
